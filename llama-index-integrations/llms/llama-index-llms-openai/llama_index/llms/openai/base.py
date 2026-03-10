@@ -1,4 +1,5 @@
 import functools
+import re
 from json.decoder import JSONDecodeError
 from typing import (
     TYPE_CHECKING,
@@ -43,6 +44,7 @@ from llama_index.core.base.llms.types import (
     CompletionResponseGen,
     LLMMetadata,
     MessageRole,
+    ThinkingBlock,
     ToolCallBlock,
     TextBlock,
 )
@@ -78,6 +80,7 @@ from llama_index.llms.openai.utils import (
     to_openai_message_dicts,
     update_tool_calls,
     is_json_schema_supported,
+    is_chatcomp_api_supported,
 )
 from openai import AsyncOpenAI
 from openai import OpenAI as SyncOpenAI
@@ -234,7 +237,9 @@ class OpenAI(FunctionCallingLLM):
         default=False,
         description="Whether to use strict mode for invoking tools/using schemas.",
     )
-    reasoning_effort: Optional[Literal["low", "medium", "high", "minimal"]] = Field(
+    reasoning_effort: Optional[
+        Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+    ] = Field(
         default=None,
         description="The effort to use for reasoning models.",
     )
@@ -277,7 +282,9 @@ class OpenAI(FunctionCallingLLM):
         pydantic_program_mode: PydanticProgramMode = PydanticProgramMode.DEFAULT,
         output_parser: Optional[BaseOutputParser] = None,
         strict: bool = False,
-        reasoning_effort: Optional[Literal["low", "medium", "high"]] = None,
+        reasoning_effort: Optional[
+            Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+        ] = None,
         modalities: Optional[List[str]] = None,
         audio_config: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
@@ -298,6 +305,11 @@ class OpenAI(FunctionCallingLLM):
         # TODO: Temp forced to 1.0 for o1
         if model in O1_MODELS:
             temperature = 1.0
+
+        if not is_chatcomp_api_supported(model):
+            raise ValueError(
+                f"Cannot use model {model} as it is only supported by the Responses API. Use the OpenAIResponses class for it."
+            )
 
         super().__init__(
             model=model,
@@ -466,7 +478,7 @@ class OpenAI(FunctionCallingLLM):
             )
             all_kwargs.pop("max_tokens", None)
         if self.model in O1_MODELS and self.reasoning_effort is not None:
-            # O1 models support reasoning_effort of low, medium, high
+            # O1 models support reasoning_effort of none, minimal, low, medium, high, xhigh
             all_kwargs["reasoning_effort"] = self.reasoning_effort
 
         if self.modalities is not None:
@@ -529,6 +541,7 @@ class OpenAI(FunctionCallingLLM):
 
         def gen() -> ChatResponseGen:
             content = ""
+            reasoning_content = ""
             tool_calls: List[ChoiceDeltaToolCall] = []
 
             is_function = False
@@ -554,13 +567,24 @@ class OpenAI(FunctionCallingLLM):
                 role = delta.role or MessageRole.ASSISTANT
                 content_delta = delta.content or ""
                 content += content_delta
+
+                # Extract reasoning_content for chain-of-thought streaming.
+                # Many OpenAI-compatible providers surface this extra field.
+                raw_reasoning = getattr(delta, "reasoning_content", None)
+                reasoning_delta = (
+                    raw_reasoning if isinstance(raw_reasoning, str) else ""
+                )
+                reasoning_content += reasoning_delta
+
+                if reasoning_content:
+                    blocks.append(ThinkingBlock(content=reasoning_content))
                 blocks.append(TextBlock(text=content))
 
-                additional_kwargs = {}
+                message_additional_kwargs = {}
                 if is_function:
                     tool_calls = update_tool_calls(tool_calls, delta.tool_calls)
                     if tool_calls:
-                        additional_kwargs["tool_calls"] = tool_calls
+                        message_additional_kwargs["tool_calls"] = tool_calls
                         for tool_call in tool_calls:
                             if tool_call.function:
                                 blocks.append(
@@ -571,15 +595,21 @@ class OpenAI(FunctionCallingLLM):
                                     )
                                 )
 
+                # thinking_delta goes in ChatResponse.additional_kwargs
+                # (same pattern as Ollama) so agents can read it
+                response_additional_kwargs = self._get_response_token_counts(response)
+                if reasoning_delta:
+                    response_additional_kwargs["thinking_delta"] = reasoning_delta
+
                 yield ChatResponse(
                     message=ChatMessage(
                         role=role,
                         blocks=blocks,
-                        additional_kwargs=additional_kwargs,
+                        additional_kwargs=message_additional_kwargs,
                     ),
                     delta=content_delta,
                     raw=response,
-                    additional_kwargs=self._get_response_token_counts(response),
+                    additional_kwargs=response_additional_kwargs,
                 )
 
         return gen()
@@ -796,6 +826,7 @@ class OpenAI(FunctionCallingLLM):
 
         async def gen() -> ChatResponseAsyncGen:
             content = ""
+            reasoning_content = ""
             tool_calls: List[ChoiceDeltaToolCall] = []
 
             is_function = False
@@ -832,13 +863,24 @@ class OpenAI(FunctionCallingLLM):
                 role = delta.role or MessageRole.ASSISTANT
                 content_delta = delta.content or ""
                 content += content_delta
+
+                # Extract reasoning_content for chain-of-thought streaming.
+                # Many OpenAI-compatible providers surface this extra field.
+                raw_reasoning = getattr(delta, "reasoning_content", None)
+                reasoning_delta = (
+                    raw_reasoning if isinstance(raw_reasoning, str) else ""
+                )
+                reasoning_content += reasoning_delta
+
+                if reasoning_content:
+                    blocks.append(ThinkingBlock(content=reasoning_content))
                 blocks.append(TextBlock(text=content))
 
-                additional_kwargs = {}
+                message_additional_kwargs = {}
                 if is_function:
                     tool_calls = update_tool_calls(tool_calls, delta.tool_calls)
                     if tool_calls:
-                        additional_kwargs["tool_calls"] = tool_calls
+                        message_additional_kwargs["tool_calls"] = tool_calls
                         for tool_call in tool_calls:
                             if tool_call.function:
                                 blocks.append(
@@ -849,15 +891,21 @@ class OpenAI(FunctionCallingLLM):
                                     )
                                 )
 
+                # thinking_delta goes in ChatResponse.additional_kwargs
+                # (same pattern as Ollama) so agents can read it
+                response_additional_kwargs = self._get_response_token_counts(response)
+                if reasoning_delta:
+                    response_additional_kwargs["thinking_delta"] = reasoning_delta
+
                 yield ChatResponse(
                     message=ChatMessage(
                         role=role,
                         blocks=blocks,
-                        additional_kwargs=additional_kwargs,
+                        additional_kwargs=message_additional_kwargs,
                     ),
                     delta=content_delta,
                     raw=response,
-                    additional_kwargs=self._get_response_token_counts(response),
+                    additional_kwargs=response_additional_kwargs,
                 )
 
         return gen()
@@ -962,7 +1010,7 @@ class OpenAI(FunctionCallingLLM):
         if user_msg:
             messages.append(user_msg)
 
-        return {
+        kwargs = {
             "messages": messages,
             "tools": tool_specs or None,
             "tool_choice": resolve_tool_choice(tool_choice, tool_required)
@@ -970,6 +1018,11 @@ class OpenAI(FunctionCallingLLM):
             else None,
             **kwargs,
         }
+
+        if tool_specs and self.model not in O1_MODELS:
+            kwargs["parallel_tool_calls"] = allow_parallel_tool_calls
+
+        return kwargs
 
     def _validate_chat_with_tools_response(
         self,
@@ -1064,7 +1117,14 @@ class OpenAI(FunctionCallingLLM):
         )
 
         llm_kwargs = llm_kwargs or {}
-        llm_kwargs["response_format"] = _type_to_response_format(output_cls)
+        response_format = _type_to_response_format(output_cls)
+        if isinstance(response_format, dict):
+            json_schema = response_format.get("json_schema")
+            if isinstance(json_schema, dict) and "name" in json_schema:
+                json_schema["name"] = re.sub(
+                    r"[^a-zA-Z0-9_-]", "_", str(json_schema["name"])
+                )
+        llm_kwargs["response_format"] = response_format
         if "tool_choice" in llm_kwargs:
             del llm_kwargs["tool_choice"]
         return llm_kwargs

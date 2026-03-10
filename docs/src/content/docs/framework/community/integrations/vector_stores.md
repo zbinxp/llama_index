@@ -52,7 +52,9 @@ as the storage backend for `VectorStoreIndex`.
 - TiDB (`TiDBVectorStore`). [Quickstart](/python/examples/vector_stores/tidbvector). [Installation](https://tidb.cloud/ai). [Python Client](https://github.com/pingcap/tidb-vector-python).
 - TimeScale (`TimescaleVectorStore`). [Installation](https://github.com/timescale/python-vector).
 - Upstash (`UpstashVectorStore`). [Quickstart](https://upstash.com/docs/vector/overall/getstarted)
+- VectorX DB (`VectorXVectorStore`). [Quickstart](https://docs.vectorxdb.ai/quickstart)
 - Vertex AI Vector Search (`VertexAIVectorStore`). [Quickstart](https://cloud.google.com/vertex-ai/docs/vector-search/quickstart)
+- Volcengine MySQL (VolcengineMySQLVectorStore). [Quickstart](https://www.volcengine.com/docs/6313/1978527?lang=en)
 - Weaviate (`WeaviateVectorStore`). [Installation](https://weaviate.io/developers/weaviate/installation). [Python Client](https://weaviate.io/developers/weaviate/client-libraries/python).
 - WordLift (`WordliftVectorStore`). [Quickstart](https://docs.wordlift.io/llm-connectors/wordlift-vector-store/). [Python Client](https://pypi.org/project/wordlift-client/).
 - Zep (`ZepVectorStore`). [Installation](https://docs.getzep.com/deployment/quickstart/). [Python Client](https://docs.getzep.com/sdk/).
@@ -697,9 +699,12 @@ mongo_uri = (
     "mongodb+srv://<username>:<password>@<host>?retryWrites=true&w=majority"
 )
 mongodb_client = pymongo.MongoClient(mongo_uri)
+async_mongodb_client = pymongo.AsyncMongoClient(mongo_uri)
 
 # construct store
-store = MongoDBAtlasVectorSearch(mongodb_client)
+store = MongoDBAtlasVectorSearch(
+    mongodb_client=mongodb_client, async_mongodb_client=async_mongodb_client
+)
 storage_context = StorageContext.from_defaults(vector_store=store)
 uber_docs = SimpleDirectoryReader(
     input_files=["../data/10k/uber_2021.pdf"]
@@ -895,6 +900,56 @@ vector_store = TimescaleVectorStore.from_params(
 from llama_index.vector_stores.upstash import UpstashVectorStore
 
 vector_store = UpstashVectorStore(url="YOUR_URL", token="YOUR_TOKEN")
+```
+
+**VectorX DB**
+
+```python
+from vecx_llamaindex import VectorXVectorStore
+from llama_index.core import StorageContext
+import time
+
+# Create a unique index name with timestamp to avoid conflicts
+timestamp = int(time.time())
+index_name = f"llamaindex_demo_{timestamp}"
+
+# Set up the embedding model
+embed_model = OpenAIEmbedding()
+
+# Get the embedding dimension
+dimension = 1536  # OpenAI's default embedding dimension
+
+# Initialize the VectorX vector store
+vector_store = VectorXVectorStore.from_params(
+    api_token=vecx_api_token,
+    encryption_key=encryption_key,
+    index_name=index_name,
+    dimension=dimension,
+    space_type="cosine",  # Can be "cosine", "l2", or "ip"
+)
+
+storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+index = VectorStoreIndex.from_documents(
+    documents, storage_context=storage_context, embed_model=embed_model
+)
+
+query_engine = index.as_query_engine()
+
+# Ask a question
+response = query_engine.query("What is Python?")
+
+# Create a filtered retriever to only search within AI-related documents
+ai_filter = MetadataFilter(
+    key="category", value="ai", operator=FilterOperator.EQ
+)
+ai_filters = MetadataFilters(filters=[ai_filter])
+
+# Create a filtered query engine
+filtered_query_engine = index.as_query_engine(filters=ai_filters)
+
+# Ask a general question but only using AI documents
+response = filtered_query_engine.query("What is learning from data?")
 ```
 
 **Vertex AI Vector Search**
@@ -1196,6 +1251,7 @@ documents = reader.load_data(
 - [Tencent](/python/examples/vector_stores/tencentvectordbindexdemo)
 - [Timesacle](/python/examples/vector_stores/timescalevector)
 - [Upstash](/python/examples/vector_stores/upstashvectordemo)
+- [VectorX DB](/python/examples/vector_stores/vectorxdbdemo)
 - [Weaviate](/python/examples/vector_stores/weaviateindexdemo)
 - [Weaviate Hybrid Search](/python/examples/vector_stores/weaviateindexdemo-hybrid)
 - [WordLift](/python/examples/vector_stores/wordliftdemo)

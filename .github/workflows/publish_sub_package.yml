@@ -6,14 +6,14 @@ on:
       - main
 
 env:
-  PYTHON_VERSION: "3.10"
+  PYTHON_VERSION: "3.12"
 
 jobs:
   publish_subpackage_if_needed:
     if: github.repository == 'run-llama/llama_index'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -55,3 +55,4 @@ jobs:
 
             cd - >/dev/null
           done
+          exit $result # exit with a non-zero code if one or more failures

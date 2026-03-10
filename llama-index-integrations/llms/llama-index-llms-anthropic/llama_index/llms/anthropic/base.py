@@ -1,8 +1,11 @@
 import json
 import logging
+import llama_index.core.instrumentation as instrument
+from importlib.metadata import version as get_version
 from typing import (
     TYPE_CHECKING,
     Any,
+    Type,
     AsyncGenerator,
     Callable,
     Dict,
@@ -13,8 +16,9 @@ from typing import (
     Set,
     Tuple,
     Union,
+    cast,
 )
-
+from llama_index.core.llms.utils import parse_partial_json
 from llama_index.core.base.llms.types import (
     ChatMessage,
     ChatResponse,
@@ -23,6 +27,7 @@ from llama_index.core.base.llms.types import (
     LLMMetadata,
     MessageRole,
     ContentBlock,
+    ToolCallBlock,
 )
 from llama_index.core.base.llms.types import TextBlock as LITextBlock
 from llama_index.core.base.llms.types import CitationBlock as LICitationBlock
@@ -35,8 +40,8 @@ from llama_index.core.llms.callbacks import (
     llm_completion_callback,
 )
 from llama_index.core.llms.function_calling import FunctionCallingLLM, ToolSelection
-from llama_index.core.llms.utils import parse_partial_json
-from llama_index.core.types import BaseOutputParser, PydanticProgramMode
+from llama_index.core.types import BaseOutputParser, PydanticProgramMode, Model
+from llama_index.core.prompts import PromptTemplate
 from llama_index.core.utils import Tokenizer
 from llama_index.llms.anthropic.utils import (
     anthropic_modelname_to_contextsize,
@@ -44,6 +49,9 @@ from llama_index.llms.anthropic.utils import (
     is_anthropic_prompt_caching_supported_model,
     is_function_calling_model,
     messages_to_anthropic_messages,
+    update_tool_calls,
+    messages_to_anthropic_beta_messages,
+    is_anthropic_structured_output_supported,
 )
 
 import anthropic
@@ -57,6 +65,9 @@ from anthropic.types import (
     RawContentBlockDeltaEvent,
     RawContentBlockStartEvent,
     RawContentBlockStopEvent,
+    RawMessageDeltaEvent,
+    RawMessageStartEvent,
+    RawMessageStopEvent,
     TextBlock,
     TextDelta,
     ThinkingBlock,
@@ -68,12 +79,32 @@ from anthropic.types import (
 
 if TYPE_CHECKING:
     from llama_index.core.tools.types import BaseTool
+    from llama_index.core.program.utils import FlexibleModel
 
 
 logger = logging.getLogger(__name__)
+dispatcher = instrument.get_dispatcher(__name__)
 
 DEFAULT_ANTHROPIC_MODEL = "claude-2.1"
 DEFAULT_ANTHROPIC_MAX_TOKENS = 512
+
+
+def _get_default_headers(
+    user_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    """Merge default User-Agent header with user-provided headers."""
+    try:
+        package_version = get_version("llama-index-core")
+    except Exception:
+        package_version = "unknown"
+
+    default_headers = {"User-Agent": f"llama-index/{package_version}"}
+
+    if user_headers:
+        # Merge headers, with user-provided headers taking precedence
+        return {**default_headers, **user_headers}
+
+    return default_headers
 
 
 class AnthropicTokenizer:
@@ -236,13 +267,16 @@ class Anthropic(FunctionCallingLLM):
             mcp_servers=mcp_servers,
         )
 
+        # Merge default User-Agent header with user-provided headers
+        merged_headers = _get_default_headers(default_headers)
+
         if region and project_id and not aws_region:
             self._client = anthropic.AnthropicVertex(
                 region=region,
                 project_id=project_id,
                 timeout=timeout,
                 max_retries=max_retries,
-                default_headers=default_headers,
+                default_headers=merged_headers,
             )
 
             self._aclient = anthropic.AsyncAnthropicVertex(
@@ -250,7 +284,7 @@ class Anthropic(FunctionCallingLLM):
                 project_id=project_id,
                 timeout=timeout,
                 max_retries=max_retries,
-                default_headers=default_headers,
+                default_headers=merged_headers,
             )
         elif aws_region:
             self._client = anthropic.AnthropicBedrock(
@@ -258,7 +292,7 @@ class Anthropic(FunctionCallingLLM):
                 aws_access_key=aws_access_key_id,
                 aws_secret_key=aws_secret_access_key,
                 max_retries=max_retries,
-                default_headers=default_headers,
+                default_headers=merged_headers,
                 timeout=timeout,
             )
             self._aclient = anthropic.AsyncAnthropicBedrock(
@@ -266,7 +300,7 @@ class Anthropic(FunctionCallingLLM):
                 aws_access_key=aws_access_key_id,
                 aws_secret_key=aws_secret_access_key,
                 max_retries=max_retries,
-                default_headers=default_headers,
+                default_headers=merged_headers,
                 timeout=timeout,
             )
         else:
@@ -275,14 +309,14 @@ class Anthropic(FunctionCallingLLM):
                 base_url=base_url,
                 timeout=timeout,
                 max_retries=max_retries,
-                default_headers=default_headers,
+                default_headers=merged_headers,
             )
             self._aclient = anthropic.AsyncAnthropic(
                 api_key=api_key,
                 base_url=base_url,
                 timeout=timeout,
                 max_retries=max_retries,
-                default_headers=default_headers,
+                default_headers=merged_headers,
             )
 
     @classmethod
@@ -351,8 +385,7 @@ class Anthropic(FunctionCallingLLM):
 
     def _get_blocks_and_tool_calls_and_thinking(
         self, response: Any
-    ) -> Tuple[List[ContentBlock], List[Dict[str, Any]], List[Dict[str, Any]]]:
-        tool_calls = []
+    ) -> Tuple[List[ContentBlock], List[Dict[str, Any]]]:
         blocks: List[ContentBlock] = []
         citations: List[TextCitation] = []
         tracked_citations: Set[str] = set()
@@ -392,9 +425,15 @@ class Anthropic(FunctionCallingLLM):
                     )
                 )
             elif isinstance(content_block, ToolUseBlock):
-                tool_calls.append(content_block.model_dump())
+                blocks.append(
+                    ToolCallBlock(
+                        tool_call_id=content_block.id,
+                        tool_kwargs=cast(Dict[str, Any] | str, content_block.input),
+                        tool_name=content_block.name,
+                    )
+                )
 
-        return blocks, tool_calls, [x.model_dump() for x in citations]
+        return blocks, [x.model_dump() for x in citations]
 
     @llm_chat_callback()
     def chat(
@@ -412,17 +451,12 @@ class Anthropic(FunctionCallingLLM):
             **all_kwargs,
         )
 
-        blocks, tool_calls, citations = self._get_blocks_and_tool_calls_and_thinking(
-            response
-        )
+        blocks, citations = self._get_blocks_and_tool_calls_and_thinking(response)
 
         return AnthropicChatResponse(
             message=ChatMessage(
                 role=MessageRole.ASSISTANT,
                 blocks=blocks,
-                additional_kwargs={
-                    "tool_calls": tool_calls,
-                },
             ),
             citations=citations,
             raw=dict(response),
@@ -460,6 +494,10 @@ class Anthropic(FunctionCallingLLM):
             cur_citations: List[Dict[str, Any]] = []
             tracked_citations: Set[str] = set()
             role = MessageRole.ASSISTANT
+            # Track usage metadata and stop_reason from RawMessage events
+            usage_metadata: Dict[str, Any] = {}
+            input_tokens: Optional[int] = None
+            stop_reason: Optional[str] = None
             for r in response:
                 if isinstance(r, (ContentBlockDeltaEvent, RawContentBlockDeltaEvent)):
                     if isinstance(r.delta, TextDelta):
@@ -536,12 +574,21 @@ class Anthropic(FunctionCallingLLM):
                     else:
                         tool_calls_to_send = cur_tool_calls
 
+                    for tool_call in tool_calls_to_send:
+                        tc = ToolCallBlock(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            tool_kwargs=cast(Dict[str, Any] | str, tool_call.input),
+                        )
+                        update_tool_calls(content, tc)
+
                     yield AnthropicChatResponse(
                         message=ChatMessage(
                             role=role,
                             blocks=content,
                             additional_kwargs={
-                                "tool_calls": [t.dict() for t in tool_calls_to_send]
+                                "usage": usage_metadata if usage_metadata else None,
+                                "stop_reason": stop_reason,
                             },
                         ),
                         citations=cur_citations,
@@ -560,18 +607,70 @@ class Anthropic(FunctionCallingLLM):
                         content.append(cur_block)
                         cur_block = None
 
+                    if cur_tool_call is not None:
+                        tool_calls_to_send = [*cur_tool_calls, cur_tool_call]
+                    else:
+                        tool_calls_to_send = cur_tool_calls
+
+                    for tool_call in tool_calls_to_send:
+                        tc = ToolCallBlock(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            tool_kwargs=cast(Dict[str, Any] | str, tool_call.input),
+                        )
+                        update_tool_calls(content, tc)
+
                     yield AnthropicChatResponse(
                         message=ChatMessage(
                             role=role,
                             blocks=content,
                             additional_kwargs={
-                                "tool_calls": [t.dict() for t in tool_calls_to_send]
+                                "usage": usage_metadata if usage_metadata else None,
+                                "stop_reason": stop_reason,
                             },
                         ),
                         citations=cur_citations,
                         delta="",
                         raw=dict(r),
                     )
+                elif isinstance(r, RawMessageStartEvent):
+                    # Capture initial usage metadata from message_start
+                    if hasattr(r.message, "usage") and r.message.usage:
+                        # Save input tokens for later
+                        input_tokens = r.message.usage.input_tokens
+                        usage_metadata = {
+                            "input_tokens": r.message.usage.input_tokens,
+                            "output_tokens": r.message.usage.output_tokens,
+                        }
+                elif isinstance(r, RawMessageDeltaEvent):
+                    # Update usage metadata and capture stop_reason from message_delta
+                    if hasattr(r, "usage") and r.usage:
+                        # Modify r.usage.input_tokens if None with saved input tokens value
+                        r.usage.input_tokens = r.usage.input_tokens or input_tokens
+                        usage_metadata = {
+                            "input_tokens": r.usage.input_tokens,
+                            "output_tokens": r.usage.output_tokens,
+                        }
+                    if hasattr(r, "delta") and hasattr(r.delta, "stop_reason"):
+                        stop_reason = r.delta.stop_reason
+
+                    # Yield a final chunk with updated metadata including stop_reason
+                    yield AnthropicChatResponse(
+                        message=ChatMessage(
+                            role=role,
+                            blocks=content,
+                            additional_kwargs={
+                                "usage": usage_metadata if usage_metadata else None,
+                                "stop_reason": stop_reason,
+                            },
+                        ),
+                        citations=cur_citations,
+                        delta="",
+                        raw=dict(r),
+                    )
+                elif isinstance(r, RawMessageStopEvent):
+                    # Final event - no additional data to capture
+                    pass
 
         return gen()
 
@@ -604,17 +703,12 @@ class Anthropic(FunctionCallingLLM):
             **all_kwargs,
         )
 
-        blocks, tool_calls, citations = self._get_blocks_and_tool_calls_and_thinking(
-            response
-        )
+        blocks, citations = self._get_blocks_and_tool_calls_and_thinking(response)
 
         return AnthropicChatResponse(
             message=ChatMessage(
                 role=MessageRole.ASSISTANT,
                 blocks=blocks,
-                additional_kwargs={
-                    "tool_calls": tool_calls,
-                },
             ),
             citations=citations,
             raw=dict(response),
@@ -652,6 +746,10 @@ class Anthropic(FunctionCallingLLM):
             cur_citations: List[Dict[str, Any]] = []
             tracked_citations: Set[str] = set()
             role = MessageRole.ASSISTANT
+            # Track usage metadata and stop_reason from RawMessage events
+            usage_metadata: Dict[str, Any] = {}
+            input_tokens: Optional[int] = None
+            stop_reason: Optional[str] = None
             async for r in response:
                 if isinstance(r, (ContentBlockDeltaEvent, RawContentBlockDeltaEvent)):
                     if isinstance(r.delta, TextDelta):
@@ -728,12 +826,21 @@ class Anthropic(FunctionCallingLLM):
                     else:
                         tool_calls_to_send = cur_tool_calls
 
+                    for tool_call in tool_calls_to_send:
+                        tc = ToolCallBlock(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            tool_kwargs=cast(Dict[str, Any] | str, tool_call.input),
+                        )
+                        update_tool_calls(content, tc)
+
                     yield AnthropicChatResponse(
                         message=ChatMessage(
                             role=role,
                             blocks=content,
                             additional_kwargs={
-                                "tool_calls": [t.dict() for t in tool_calls_to_send]
+                                "usage": usage_metadata if usage_metadata else None,
+                                "stop_reason": stop_reason,
                             },
                         ),
                         citations=cur_citations,
@@ -752,18 +859,70 @@ class Anthropic(FunctionCallingLLM):
                         content.append(cur_block)
                         cur_block = None
 
+                    if cur_tool_call is not None:
+                        tool_calls_to_send = [*cur_tool_calls, cur_tool_call]
+                    else:
+                        tool_calls_to_send = cur_tool_calls
+
+                    for tool_call in tool_calls_to_send:
+                        tc = ToolCallBlock(
+                            tool_call_id=tool_call.id,
+                            tool_name=tool_call.name,
+                            tool_kwargs=cast(Dict[str, Any] | str, tool_call.input),
+                        )
+                        update_tool_calls(content, tc)
+
                     yield AnthropicChatResponse(
                         message=ChatMessage(
                             role=role,
                             blocks=content,
                             additional_kwargs={
-                                "tool_calls": [t.dict() for t in tool_calls_to_send]
+                                "usage": usage_metadata if usage_metadata else None,
+                                "stop_reason": stop_reason,
                             },
                         ),
                         citations=cur_citations,
                         delta="",
                         raw=dict(r),
                     )
+                elif isinstance(r, RawMessageStartEvent):
+                    # Capture initial usage metadata from message_start
+                    if hasattr(r.message, "usage") and r.message.usage:
+                        # Save input tokens for later
+                        input_tokens = r.message.usage.input_tokens
+                        usage_metadata = {
+                            "input_tokens": r.message.usage.input_tokens,
+                            "output_tokens": r.message.usage.output_tokens,
+                        }
+                elif isinstance(r, RawMessageDeltaEvent):
+                    # Update usage metadata and capture stop_reason from message_delta
+                    if hasattr(r, "usage") and r.usage:
+                        # Modify r.usage.input_tokens if None with saved input tokens value
+                        r.usage.input_tokens = r.usage.input_tokens or input_tokens
+                        usage_metadata = {
+                            "input_tokens": r.usage.input_tokens,
+                            "output_tokens": r.usage.output_tokens,
+                        }
+                    if hasattr(r, "delta") and hasattr(r.delta, "stop_reason"):
+                        stop_reason = r.delta.stop_reason
+
+                    # Yield a final chunk with updated metadata including stop_reason
+                    yield AnthropicChatResponse(
+                        message=ChatMessage(
+                            role=role,
+                            blocks=content,
+                            additional_kwargs={
+                                "usage": usage_metadata if usage_metadata else None,
+                                "stop_reason": stop_reason,
+                            },
+                        ),
+                        citations=cur_citations,
+                        delta="",
+                        raw=dict(r),
+                    )
+                elif isinstance(r, RawMessageStopEvent):
+                    # Final event - no additional data to capture
+                    pass
 
         return gen()
 
@@ -867,7 +1026,11 @@ class Anthropic(FunctionCallingLLM):
         **kwargs: Any,
     ) -> List[ToolSelection]:
         """Predict and call the tool."""
-        tool_calls = response.message.additional_kwargs.get("tool_calls", [])
+        tool_calls = [
+            block
+            for block in response.message.blocks
+            if isinstance(block, ToolCallBlock)
+        ]
 
         if len(tool_calls) < 1:
             if error_on_no_tool_call:
@@ -879,26 +1042,166 @@ class Anthropic(FunctionCallingLLM):
 
         tool_selections = []
         for tool_call in tool_calls:
-            if (
-                "input" not in tool_call
-                or "id" not in tool_call
-                or "name" not in tool_call
-            ):
-                raise ValueError("Invalid tool call.")
-            if tool_call["type"] != "tool_use":
-                raise ValueError("Invalid tool type. Unsupported by Anthropic")
             argument_dict = (
-                json.loads(tool_call["input"])
-                if isinstance(tool_call["input"], str)
-                else tool_call["input"]
+                json.loads(tool_call.tool_kwargs)
+                if isinstance(tool_call.tool_kwargs, str)
+                else tool_call.tool_kwargs
             )
 
             tool_selections.append(
                 ToolSelection(
-                    tool_id=tool_call["id"],
-                    tool_name=tool_call["name"],
+                    tool_id=tool_call.tool_call_id or "",
+                    tool_name=tool_call.tool_name,
                     tool_kwargs=argument_dict,
                 )
             )
 
         return tool_selections
+
+    @dispatcher.span
+    def structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Model:
+        messages = prompt.format_messages(**prompt_args)
+        ant_messages, system = messages_to_anthropic_beta_messages(messages)
+        if isinstance(
+            self._client, (anthropic.AnthropicVertex, anthropic.AnthropicBedrock)
+        ) or not is_anthropic_structured_output_supported(self.model):
+            return super().structured_predict(
+                output_cls, prompt, llm_kwargs, **prompt_args
+            )
+        response = self._client.beta.messages.parse(
+            messages=ant_messages,
+            model=self.model,
+            max_tokens=(llm_kwargs or {}).get("max_tokens", 8192),
+            output_format=output_cls,
+            system=system,
+            betas=["structured-outputs-2025-11-13"],
+            **(llm_kwargs or {}),
+        )
+        parsed = response.parsed_output
+        stop_reason = response.stop_reason
+        if parsed is not None:
+            return parsed
+        raise ValueError(
+            f"It was not possible to produce a structured response{' because of ' + stop_reason if stop_reason is not None else ''}"
+        )
+
+    @dispatcher.span
+    async def astructured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Model:
+        messages = prompt.format_messages(**prompt_args)
+        ant_messages, system = messages_to_anthropic_beta_messages(messages)
+        if isinstance(
+            self._aclient,
+            (anthropic.AsyncAnthropicVertex, anthropic.AsyncAnthropicBedrock),
+        ) or not is_anthropic_structured_output_supported(self.model):
+            return await super().astructured_predict(
+                output_cls, prompt, llm_kwargs, **prompt_args
+            )
+        response = await self._aclient.beta.messages.parse(
+            messages=ant_messages,
+            model=self.model,
+            max_tokens=(llm_kwargs or {}).get("max_tokens", 8192),
+            output_format=output_cls,
+            system=system,
+            betas=["structured-outputs-2025-11-13"],
+            **(llm_kwargs or {}),
+        )
+        parsed = response.parsed_output
+        stop_reason = response.stop_reason
+        if parsed is not None:
+            return parsed
+        raise ValueError(
+            f"It was not possible to produce a structured response{' because of ' + stop_reason if stop_reason is not None else ''}"
+        )
+
+    @dispatcher.span
+    def stream_structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> Generator[Union[Model, "FlexibleModel"], Any, Any]:
+        logger.warning(
+            "Streaming not fully supported for Anthropic structured outputs."
+        )
+        messages = prompt.format_messages(**prompt_args)
+        ant_messages, system = messages_to_anthropic_beta_messages(messages)
+        if isinstance(
+            self._client, (anthropic.AnthropicVertex, anthropic.AnthropicBedrock)
+        ) or not is_anthropic_structured_output_supported(self.model):
+            return super().stream_structured_predict(
+                output_cls, prompt, llm_kwargs, **prompt_args
+            )
+        response = self._client.beta.messages.parse(
+            messages=ant_messages,
+            model=self.model,
+            max_tokens=(llm_kwargs or {}).get("max_tokens", 8192),
+            output_format=output_cls,
+            system=system,
+            betas=["structured-outputs-2025-11-13"],
+            **(llm_kwargs or {}),
+        )
+        parsed = response.parsed_output
+        stop_reason = response.stop_reason
+        if parsed is not None:
+
+            def gen() -> Generator[Model, Any, None]:
+                yield parsed
+
+            return gen()
+        raise ValueError(
+            f"It was not possible to produce a structured response{' because of ' + stop_reason if stop_reason is not None else ''}"
+        )
+
+    @dispatcher.span
+    async def astream_structured_predict(
+        self,
+        output_cls: Type[Model],
+        prompt: PromptTemplate,
+        llm_kwargs: Optional[Dict[str, Any]] = None,
+        **prompt_args: Any,
+    ) -> AsyncGenerator[Union[Model, "FlexibleModel"], Any]:
+        logger.warning(
+            "Streaming not fully supported for Anthropic structured outputs."
+        )
+        messages = prompt.format_messages(**prompt_args)
+        ant_messages, system = messages_to_anthropic_beta_messages(messages)
+        if isinstance(
+            self._aclient,
+            (anthropic.AsyncAnthropicVertex, anthropic.AsyncAnthropicBedrock),
+        ) or not is_anthropic_structured_output_supported(self.model):
+            return await super().astream_structured_predict(
+                output_cls, prompt, llm_kwargs, **prompt_args
+            )
+        response = await self._aclient.beta.messages.parse(
+            messages=ant_messages,
+            model=self.model,
+            max_tokens=(llm_kwargs or {}).get("max_tokens", 8192),
+            output_format=output_cls,
+            system=system,
+            betas=["structured-outputs-2025-11-13"],
+            **(llm_kwargs or {}),
+        )
+        parsed = response.parsed_output
+        stop_reason = response.stop_reason
+        if parsed is not None:
+
+            async def gen() -> AsyncGenerator[Model, Any]:
+                yield parsed
+
+            return gen()
+        raise ValueError(
+            f"It was not possible to produce a structured response{' because of ' + stop_reason if stop_reason is not None else ''}"
+        )

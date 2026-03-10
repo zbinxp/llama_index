@@ -1,5 +1,6 @@
 import random
 import string
+import json
 import os
 from llama_index.core.base.llms.types import ImageBlock, TextBlock
 import pytest
@@ -14,6 +15,7 @@ from llama_index.core.base.llms.types import (
     ThinkingBlock,
     CachePoint,
     CacheControl,
+    ToolCallBlock,
 )
 from llama_index.core.callbacks import CallbackManager
 from llama_index.core.tools import FunctionTool
@@ -82,7 +84,8 @@ def bedrock_converse_integration():
 def bedrock_converse_integration_thinking():
     """Create a BedrockConverse instance for integration tests with proper credentials."""
     return BedrockConverse(
-        model="anthropic.claude-3-7-sonnet-20250219-v1:0",
+        model=os.getenv("BEDROCK_THINKING_MODEL")
+        or "anthropic.claude-3-7-sonnet-20250219-v1:0",
         region_name=os.getenv("AWS_REGION", "us-east-1"),
         aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
@@ -106,6 +109,15 @@ def bedrock_converse_integration_no_system_prompt_caching_param():
 
 class MockExceptions:
     class ThrottlingException(Exception):
+        pass
+
+    class InternalServerException(Exception):
+        pass
+
+    class ServiceUnavailableException(Exception):
+        pass
+
+    class ModelTimeoutException(Exception):
         pass
 
 
@@ -240,6 +252,25 @@ def test_init_app_inf_profile(bedrock_converse_with_application_inference_profil
     assert client._model_kwargs["model"] == EXP_APP_INF_PROFILE_ARN
 
 
+def test_init_adaptive_thinking_unsupported_model(mock_boto3_session):
+    with pytest.warns(UserWarning, match="does not support adaptive thinking mode"):
+        llm = BedrockConverse(
+            model="anthropic.claude-sonnet-4-20250514-v1:0",
+            thinking={"type": "adaptive"},
+            botocore_session=mock_boto3_session,
+        )
+        assert llm.thinking is None
+
+
+def test_init_adaptive_thinking_opus_46(mock_boto3_session):
+    llm = BedrockConverse(
+        model="anthropic.claude-opus-4-6-v1",
+        thinking={"type": "adaptive"},
+        botocore_session=mock_boto3_session,
+    )
+    assert llm.thinking == {"type": "adaptive"}
+
+
 def test_chat(bedrock_converse):
     response = bedrock_converse.chat(messages)
 
@@ -254,7 +285,6 @@ def test_complete(bedrock_converse):
     assert response.text == EXP_RESPONSE
     assert response.additional_kwargs["status"] == []
     assert response.additional_kwargs["tool_call_id"] == []
-    assert response.additional_kwargs["tool_calls"] == []
 
 
 def test_stream_chat(bedrock_converse):
@@ -335,7 +365,6 @@ async def test_acomplete(bedrock_converse):
     assert response.text == EXP_RESPONSE
     assert response.additional_kwargs["status"] == []
     assert response.additional_kwargs["tool_call_id"] == []
-    assert response.additional_kwargs["tool_calls"] == []
 
 
 @pytest.mark.asyncio
@@ -567,7 +596,7 @@ def test_prepare_chat_with_tools_custom_tool_choice(bedrock_converse):
     """Test that custom tool_choice overrides tool_required."""
     custom_tool_choice = {"specific": {"name": "search_tool"}}
     result = bedrock_converse._prepare_chat_with_tools(
-        tools=[search_tool], tool_required=True, tool_choice=custom_tool_choice
+        tools=[search_tool], tool_choice=custom_tool_choice
     )
 
     assert "tools" in result
@@ -908,6 +937,75 @@ async def test_bedrock_converse_thinking(bedrock_converse_integration_thinking):
 
 @needs_aws_creds
 @pytest.mark.asyncio
+async def test_bedrock_converse_thinking_delta_in_additional_kwargs(
+    bedrock_converse_integration_thinking,
+):
+    """
+    Test that thinking_delta is populated in additional_kwargs during streaming.
+
+    This test verifies that when using extended thinking mode:
+    1. Thinking content appears in additional_kwargs['thinking_delta'] during streaming
+    2. Text content appears in delta field separately from thinking content
+    3. Final message contains accumulated thinking in ThinkingBlock
+    """
+    messages = [
+        ChatMessage(
+            role=MessageRole.USER,
+            content="What is 15 + 27? Think step by step before answering.",
+        )
+    ]
+
+    # Test stream_chat
+    responses = list(bedrock_converse_integration_thinking.stream_chat(messages))
+
+    # Verify we got responses
+    assert len(responses) > 0
+
+    # Check for thinking_delta in additional_kwargs
+    thinking_responses = [
+        r
+        for r in responses
+        if r.additional_kwargs.get("thinking_delta") is not None
+        and len(r.additional_kwargs.get("thinking_delta", "")) > 0
+    ]
+    assert len(thinking_responses) > 0, (
+        "Should have at least one response with non-empty thinking_delta in additional_kwargs"
+    )
+
+    # Check that text deltas are separate from thinking deltas
+    text_responses = [
+        r
+        for r in responses
+        if r.delta and r.additional_kwargs.get("thinking_delta") is None
+    ]
+    assert len(text_responses) > 0, "Should have text responses separate from thinking"
+
+    # Verify final message has ThinkingBlock with accumulated content
+    final_response = responses[-1]
+    thinking_blocks = [
+        b for b in final_response.message.blocks if isinstance(b, ThinkingBlock)
+    ]
+    assert len(thinking_blocks) > 0, "Final message should have ThinkingBlock"
+    assert len(thinking_blocks[0].content) > 10, "ThinkingBlock should have content"
+
+    # Test astream_chat
+    async_responses = []
+    async for r in await bedrock_converse_integration_thinking.astream_chat(messages):
+        async_responses.append(r)
+
+    # Verify async streaming also has thinking_delta
+    async_thinking_responses = [
+        r
+        for r in async_responses
+        if r.additional_kwargs.get("thinking_delta") is not None
+    ]
+    assert len(async_thinking_responses) > 0, (
+        "Async streaming should also have thinking_delta in additional_kwargs"
+    )
+
+
+@needs_aws_creds
+@pytest.mark.asyncio
 async def test_bedrock_converse_integration_system_prompt_cache_points(
     bedrock_converse_integration_no_system_prompt_caching_param,
 ):
@@ -1070,3 +1168,132 @@ async def test_bedrock_converse_integration_system_prompt_caching_auto_write(
 
     # Verify response is meaningful
     assert len(str(response.message.content)) > 50, "Response should be substantial"
+
+
+@needs_aws_creds
+@pytest.mark.asyncio
+async def test_tool_call_input_output(
+    bedrock_converse_integration_thinking: BedrockConverse,
+) -> None:
+    def get_weather(location: str):
+        return f"The weather in {location} is rainy with a temperature of 15°C."
+
+    tool = FunctionTool.from_defaults(
+        fn=get_weather,
+        name="get_weather",
+        description="Get the weather of a given location",
+    )
+
+    history = [
+        ChatMessage(
+            role="user",
+            content="Hello, can you tell me what is the weather today in London?",
+        ),
+        ChatMessage(
+            role="assistant",
+            blocks=[
+                ToolCallBlock(
+                    tool_name="get_weather",
+                    tool_kwargs={"location": "Liverpool"},
+                    tool_call_id="1",
+                ),
+            ],
+        ),
+        ChatMessage(
+            role=MessageRole.TOOL,
+            content="The weather in London is 11°C and windy",
+            additional_kwargs={"tool_call_id": "1"},
+        ),
+        ChatMessage(
+            role="assistant",
+            blocks=[
+                TextBlock(
+                    text="The weather in London is windy with a temperature of 11°C"
+                )
+            ],
+        ),
+    ]
+
+    input_message = ChatMessage(
+        role="user",
+        content="Ok, and what is the weather in Liverpool?",
+    )
+
+    response = bedrock_converse_integration_thinking.chat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    assert (
+        len(
+            [
+                block
+                for block in response.message.blocks
+                if isinstance(block, ToolCallBlock)
+            ]
+        )
+        > 0
+    )
+    assert any(
+        block.tool_name == "get_weather"
+        and (
+            block.tool_kwargs == {"location": "Liverpool"}
+            or block.tool_kwargs == json.dumps({"location": "Liverpool"})
+        )
+        for block in response.message.blocks
+        if isinstance(block, ToolCallBlock)
+    )
+    aresponse = await bedrock_converse_integration_thinking.achat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    assert (
+        len(
+            [
+                block
+                for block in aresponse.message.blocks
+                if isinstance(block, ToolCallBlock)
+            ]
+        )
+        > 0
+    )
+    assert any(
+        block.tool_name == "get_weather"
+        and (
+            block.tool_kwargs == {"location": "Liverpool"}
+            or block.tool_kwargs == json.dumps({"location": "Liverpool"})
+        )
+        for block in aresponse.message.blocks
+        if isinstance(block, ToolCallBlock)
+    )
+    stream_response = bedrock_converse_integration_thinking.stream_chat_with_tools(
+        tools=[tool], user_msg=input_message, chat_history=history
+    )
+    blocks = []
+    for res in stream_response:
+        blocks.extend(res.message.blocks)
+    assert len([block for block in blocks if isinstance(block, ToolCallBlock)]) > 0
+    assert any(
+        block.tool_name == "get_weather"
+        and (
+            block.tool_kwargs == {"location": "Liverpool"}
+            or block.tool_kwargs == json.dumps({"location": "Liverpool"})
+        )
+        for block in blocks
+        if isinstance(block, ToolCallBlock)
+    )
+    astream_response = (
+        await bedrock_converse_integration_thinking.astream_chat_with_tools(
+            tools=[tool], user_msg=input_message, chat_history=history
+        )
+    )
+    ablocks = []
+    async for res in astream_response:
+        ablocks.extend(res.message.blocks)
+    assert len([block for block in ablocks if isinstance(block, ToolCallBlock)]) > 0
+    assert any(
+        block.tool_name == "get_weather"
+        and (
+            block.tool_kwargs == {"location": "Liverpool"}
+            or block.tool_kwargs == json.dumps({"location": "Liverpool"})
+        )
+        for block in ablocks
+        if isinstance(block, ToolCallBlock)
+    )
